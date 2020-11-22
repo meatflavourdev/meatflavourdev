@@ -1,5 +1,5 @@
-<h1 align="center">Hi 👋, I'm Jeremy Dombrowski</h1>
-<h3 align="center">I'm a meat flavoured full-stack designer & developer. 🦄🍖🤤</h3>
+<h1>Hi 👋, I'm Jeremy Dombrowski</h1>
+<h3>I'm a meat flavoured full-stack designer & developer. 🦄🍖🤤</h3>
 
 <p align="left"> <a href="https://twitter.com/meatflavourdev" target="blank"><img src="https://img.shields.io/twitter/follow/meatflavourdev?logo=twitter&style=social" alt="meatflavourdev" /></a> </p>
 
