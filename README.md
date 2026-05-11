@@ -5,4 +5,4 @@
 
 <h3>I write code. 👨🏻‍💻 My UI isn't ugly. 🤩 My UX is painless. 🚀</h3>
 
-<p><img align="left" src="https://github-readme-stats.vercel.app/api/top-langs?username=meatflavourdev&show_icons=true&locale=en&layout=compact&hide=liquid" alt="meatflavourdev" /></p>
+<p><img align="left" src="https://github-readme-stats-iota-sage-72.vercel.app/?username=meatflavourdev&show_icons=true&locale=en&layout=compact&hide=liquid" alt="meatflavourdev" /></p>
