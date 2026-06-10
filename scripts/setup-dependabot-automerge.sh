@@ -33,6 +33,7 @@ DELAY_MIN=1
 DELAY_MAX=3
 MAX_RETRIES=3
 RETRY_BACKOFF_FACTOR=2
+QUERY_PARAMS=""
 
 # Color codes for output
 RED='\033[0;31m'
@@ -126,6 +127,7 @@ setup_logging() {
     log INFO "Skip Forks: $SKIP_FORKS"
     log INFO "Jitter Delay: ${DELAY_MIN}-${DELAY_MAX} seconds"
     log INFO "Max Retries: $MAX_RETRIES"
+    log INFO "Merge Strategy: squash (linear history)"
     [[ -n "$REPO_LIMIT" ]] && log INFO "Repo Limit: $REPO_LIMIT"
 }
 
@@ -199,7 +201,7 @@ jobs:
           github-token: "${{ secrets.GITHUB_TOKEN }}"
       
       - name: Enable auto-merge for Dependabot PRs
-        run: gh pr merge --auto --merge "$PR_URL"
+        run: gh pr merge --auto --squash "$PR_URL"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -233,7 +235,6 @@ setup_workflow() {
     while [[ $retry_count -lt $MAX_RETRIES ]]; do
         ((retry_count++))
         
-        # Check rate limit before making request
         if ! check_rate_limit; then
             if [[ $retry_count -lt $MAX_RETRIES ]]; then
                 handle_rate_limit "$retry_count"
@@ -245,22 +246,20 @@ setup_workflow() {
             fi
         fi
         
-        # Apply jitter delay
         apply_jitter_delay
         
-        # Create workflow file using gh api
+        # FIXED: OS-agnostic base64 encoding (macOS/Linux compatible)
         if gh api \
             --method PUT \
             "repos/${repo}/contents/.github/workflows/${WORKFLOW_FILE}" \
             -f message="chore: add dependabot auto-merge workflow" \
-            -f content="$(echo -n "$workflow_content" | base64 -w 0)" \
+            -f content="$(echo -n "$workflow_content" | base64 | tr -d '\n')" \
             > /dev/null 2>&1; then
             
             log SUCCESS "Workflow created in $repo"
             ((SUCCESSFUL++))
             return 0
         else
-            # Check if it's because the file already exists
             apply_jitter_delay
             if check_workflow_exists "$repo"; then
                 log WARNING "Workflow already exists in $repo"
@@ -268,7 +267,7 @@ setup_workflow() {
                 return 0
             else
                 if [[ $retry_count -lt $MAX_RETRIES ]]; then
-                    log WARNING "Failed to create workflow in $repo (attempt $retry_count/$MAX_RETRIES), retrying..."
+                    log WARNING "Failed to create workflow in $repo (Branch protection active?). Retrying..."
                     continue
                 else
                     log ERROR "Failed to create workflow in $repo after $MAX_RETRIES attempts"
@@ -283,14 +282,15 @@ setup_workflow() {
 process_repositories() {
     log INFO "Fetching repositories..."
     
-    # Apply jitter before fetching repo list
     apply_jitter_delay
     
-    local query_params="--limit ${REPO_LIMIT:-10000}"
-    [[ "$SKIP_PRIVATE" == "true" ]] && query_params="$query_params --private=false"
-    [[ "$SKIP_FORKS" == "true" ]] && query_params="$query_params --fork=false"
+    # Preserve query params globally so verify_setup can use them later
+    QUERY_PARAMS="--limit ${REPO_LIMIT:-10000}"
+    [[ "$SKIP_PRIVATE" == "true" ]] && QUERY_PARAMS="$QUERY_PARAMS --private=false"
+    [[ "$SKIP_FORKS" == "true" ]] && QUERY_PARAMS="$QUERY_PARAMS --fork=false"
     
-    local repos=$(gh repo list "$USERNAME" $query_params --json nameWithOwner -q '.[].nameWithOwner')
+    # shellcheck disable=SC2086
+    local repos=$(gh repo list "$USERNAME" $QUERY_PARAMS --json nameWithOwner -q '.[].nameWithOwner')
     
     if [[ -z "$repos" ]]; then
         log ERROR "No repositories found"
@@ -306,12 +306,12 @@ process_repositories() {
         ((current++))
         log INFO "[$current/$repo_count] Processing $repo..."
         
-        # Apply jitter before checking repo
         apply_jitter_delay
         
-        # Check if repo has Actions enabled
-        if ! gh api "repos/${repo}" --jq '.has_issues' > /dev/null 2>&1; then
-            log WARNING "Cannot access $repo (might not have permissions)"
+        # FIXED: Skip archived repositories instead of checking for issues
+        local is_archived=$(gh api "repos/${repo}" --jq '.archived' 2>/dev/null)
+        if [[ "$is_archived" == "true" ]]; then
+            log WARNING "Skipping $repo (Repository is archived)"
             ((SKIPPED++))
             continue
         fi
@@ -329,7 +329,7 @@ print_summary() {
     log SUCCESS "Successful: $SUCCESSFUL"
     log WARNING "Already Exists: $ALREADY_EXISTS"
     log ERROR "Failed: $FAILED"
-    log WARNING "Skipped: $SKIPPED"
+    log WARNING "Skipped (archived): $SKIPPED"
     log RATE_LIMITED "Rate Limited (retried): $RATE_LIMITED"
     log INFO "======================================"
     log INFO "Log file saved to: $LOG_FILE"
@@ -342,11 +342,12 @@ print_summary() {
 verify_setup() {
     log INFO "Verifying workflow setup..."
     
-    # Apply jitter before verification
     apply_jitter_delay
     
     local verified=0
-    local repos=$(gh repo list "$USERNAME" --limit 50 --json nameWithOwner -q '.[].nameWithOwner')
+    # FIXED: Re-use the exact parameters used during processing
+    # shellcheck disable=SC2086
+    local repos=$(gh repo list "$USERNAME" $QUERY_PARAMS --json nameWithOwner -q '.[].nameWithOwner')
     
     while IFS= read -r repo; do
         apply_jitter_delay
