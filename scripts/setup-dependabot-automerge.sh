@@ -13,6 +13,7 @@
 #   --skip-private         Skip private repositories
 #   --skip-forks           Skip forked repositories
 #   --log-file FILE        Specify custom log file path
+#   --delay MIN-MAX        Set jitter delay range in seconds (default: 1-3)
 #   --help                 Show this help message
 ################################################################################
 
@@ -28,12 +29,17 @@ REPO_LIMIT=""
 SKIP_PRIVATE=false
 SKIP_FORKS=false
 USERNAME="meatflavourdev"
+DELAY_MIN=1
+DELAY_MAX=3
+MAX_RETRIES=3
+RETRY_BACKOFF_FACTOR=2
 
 # Color codes for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # Counters
@@ -42,6 +48,7 @@ SUCCESSFUL=0
 FAILED=0
 SKIPPED=0
 ALREADY_EXISTS=0
+RATE_LIMITED=0
 
 ################################################################################
 # Utility Functions
@@ -67,6 +74,9 @@ log() {
             ;;
         INFO)
             echo -e "${BLUE}ℹ ${message}${NC}"
+            ;;
+        RATE_LIMITED)
+            echo -e "${CYAN}⏱ ${message}${NC}"
             ;;
         DEBUG)
             if [[ "${DEBUG}" == "true" ]]; then
@@ -114,7 +124,57 @@ setup_logging() {
     log INFO "Dry Run: $DRY_RUN"
     log INFO "Skip Private: $SKIP_PRIVATE"
     log INFO "Skip Forks: $SKIP_FORKS"
+    log INFO "Jitter Delay: ${DELAY_MIN}-${DELAY_MAX} seconds"
+    log INFO "Max Retries: $MAX_RETRIES"
     [[ -n "$REPO_LIMIT" ]] && log INFO "Repo Limit: $REPO_LIMIT"
+}
+
+# Generate random jitter delay
+random_delay() {
+    local delay=$((RANDOM % ($DELAY_MAX - $DELAY_MIN + 1) + $DELAY_MIN))
+    echo $delay
+}
+
+# Apply jitter delay before API call
+apply_jitter_delay() {
+    local delay=$(random_delay)
+    log DEBUG "Applying jitter delay: ${delay}s"
+    sleep "$delay"
+}
+
+# Check GitHub API rate limit status
+check_rate_limit() {
+    local rate_info=$(gh api rate_limit --jq '.rate.remaining,.rate.limit,.rate.reset' 2>/dev/null)
+    
+    if [[ -n "$rate_info" ]]; then
+        local remaining=$(echo "$rate_info" | sed -n '1p')
+        local limit=$(echo "$rate_info" | sed -n '2p')
+        local reset=$(echo "$rate_info" | sed -n '3p')
+        local reset_time=$(date -d "@$reset" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown")
+        
+        log DEBUG "Rate limit: $remaining/$limit (resets at $reset_time)"
+        
+        # Warn if getting close to limit
+        if [[ $remaining -lt 100 ]]; then
+            log WARNING "Approaching rate limit: $remaining requests remaining"
+        fi
+        
+        # Return 0 if we have requests left, 1 if rate limited
+        [[ $remaining -gt 0 ]] && return 0 || return 1
+    fi
+    return 0
+}
+
+# Wait for rate limit reset with backoff
+handle_rate_limit() {
+    local retry_count=$1
+    local backoff=$((RETRY_BACKOFF_FACTOR ** (retry_count - 1)))
+    local wait_time=$((backoff * 5))
+    
+    log RATE_LIMITED "Rate limited! Waiting ${wait_time}s before retry (attempt $retry_count/$MAX_RETRIES)"
+    ((RATE_LIMITED++))
+    
+    sleep "$wait_time"
 }
 
 create_workflow_content() {
@@ -159,41 +219,72 @@ check_workflow_exists() {
 setup_workflow() {
     local repo=$1
     local workflow_content=$(create_workflow_content)
+    local retry_count=0
     
     log DEBUG "Setting up workflow for $repo"
     
     if [[ "$DRY_RUN" == "true" ]]; then
         log INFO "[DRY-RUN] Would create workflow in $repo"
+        apply_jitter_delay
         return 0
     fi
     
-    # Create workflow file using gh api
-    if gh api \
-        --method PUT \
-        "repos/${repo}/contents/.github/workflows/${WORKFLOW_FILE}" \
-        -f message="chore: add dependabot auto-merge workflow" \
-        -f content="$(echo -n "$workflow_content" | base64 -w 0)" \
-        > /dev/null 2>&1; then
+    # Retry loop with exponential backoff
+    while [[ $retry_count -lt $MAX_RETRIES ]]; do
+        ((retry_count++))
         
-        log SUCCESS "Workflow created in $repo"
-        ((SUCCESSFUL++))
-        return 0
-    else
-        # Check if it's because the file already exists
-        if check_workflow_exists "$repo"; then
-            log WARNING "Workflow already exists in $repo"
-            ((ALREADY_EXISTS++))
+        # Check rate limit before making request
+        if ! check_rate_limit; then
+            if [[ $retry_count -lt $MAX_RETRIES ]]; then
+                handle_rate_limit "$retry_count"
+                continue
+            else
+                log ERROR "Rate limited and max retries exceeded for $repo"
+                ((FAILED++))
+                return 1
+            fi
+        fi
+        
+        # Apply jitter delay
+        apply_jitter_delay
+        
+        # Create workflow file using gh api
+        if gh api \
+            --method PUT \
+            "repos/${repo}/contents/.github/workflows/${WORKFLOW_FILE}" \
+            -f message="chore: add dependabot auto-merge workflow" \
+            -f content="$(echo -n "$workflow_content" | base64 -w 0)" \
+            > /dev/null 2>&1; then
+            
+            log SUCCESS "Workflow created in $repo"
+            ((SUCCESSFUL++))
             return 0
         else
-            log ERROR "Failed to create workflow in $repo"
-            ((FAILED++))
-            return 1
+            # Check if it's because the file already exists
+            apply_jitter_delay
+            if check_workflow_exists "$repo"; then
+                log WARNING "Workflow already exists in $repo"
+                ((ALREADY_EXISTS++))
+                return 0
+            else
+                if [[ $retry_count -lt $MAX_RETRIES ]]; then
+                    log WARNING "Failed to create workflow in $repo (attempt $retry_count/$MAX_RETRIES), retrying..."
+                    continue
+                else
+                    log ERROR "Failed to create workflow in $repo after $MAX_RETRIES attempts"
+                    ((FAILED++))
+                    return 1
+                fi
+            fi
         fi
-    fi
+    done
 }
 
 process_repositories() {
     log INFO "Fetching repositories..."
+    
+    # Apply jitter before fetching repo list
+    apply_jitter_delay
     
     local query_params="--limit ${REPO_LIMIT:-10000}"
     [[ "$SKIP_PRIVATE" == "true" ]] && query_params="$query_params --private=false"
@@ -214,6 +305,9 @@ process_repositories() {
     while IFS= read -r repo; do
         ((current++))
         log INFO "[$current/$repo_count] Processing $repo..."
+        
+        # Apply jitter before checking repo
+        apply_jitter_delay
         
         # Check if repo has Actions enabled
         if ! gh api "repos/${repo}" --jq '.has_issues' > /dev/null 2>&1; then
@@ -236,6 +330,7 @@ print_summary() {
     log WARNING "Already Exists: $ALREADY_EXISTS"
     log ERROR "Failed: $FAILED"
     log WARNING "Skipped: $SKIPPED"
+    log RATE_LIMITED "Rate Limited (retried): $RATE_LIMITED"
     log INFO "======================================"
     log INFO "Log file saved to: $LOG_FILE"
     
@@ -247,10 +342,14 @@ print_summary() {
 verify_setup() {
     log INFO "Verifying workflow setup..."
     
+    # Apply jitter before verification
+    apply_jitter_delay
+    
     local verified=0
     local repos=$(gh repo list "$USERNAME" --limit 50 --json nameWithOwner -q '.[].nameWithOwner')
     
     while IFS= read -r repo; do
+        apply_jitter_delay
         if check_workflow_exists "$repo"; then
             ((verified++))
         fi
@@ -286,6 +385,10 @@ main() {
                 ;;
             --log-file)
                 LOG_FILE="$2"
+                shift 2
+                ;;
+            --delay)
+                IFS='-' read -r DELAY_MIN DELAY_MAX <<< "$2"
                 shift 2
                 ;;
             --help)
